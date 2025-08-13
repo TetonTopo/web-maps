@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oregon Fly‑around — Minimal Prod</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { position: absolute; inset: 0; }
+    .ui { position: absolute; top: 12px; left: 12px; z-index: 2; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: 10px; font: 12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+    .ui h3 { margin: 0 0 6px; font-size: 13px; }
+    .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="ui">
+    <h3>Oregon fly‑around</h3>
+    <div class="row">
+      <button id="play">Play</button>
+      <button id="pause">Pause</button>
+      <button id="restart">Restart</button>
+    </div>
+  </div>
+
+<script>
+  // Mapbox token + styles
+  mapboxgl.accessToken = 'pk.eyJ1IjoidGV0b250b3BvIiwiYSI6ImNtNm1jYzR1NzA1a2IybW83eGlkbnh5cjgifQ.i6aEqbk61S5evIU0zNFGpg';
+  const STYLE_PRIMARY = 'mapbox://styles/tetontopo/cme31qvvn01jm01qp94v07glw';
+  const STYLE_FALLBACK = 'mapbox://styles/mapbox/outdoors-v12';
+
+  // Public AGOL item — roadless areas (no filter)
+  const AGOL_ITEM_ID = '835057682c4742f2ac9f170b5a24825f';
+  const ROADLESS_ID_FIELD = 'OBJECTID';
+
+  async function buildAgolGeoJsonQueryUrl(itemId) {
+    const itemJsonUrl = `https://www.arcgis.com/sharing/rest/content/items/${itemId}?f=json`;
+    const item = await fetch(itemJsonUrl).then(r => r.json());
+    if (!item || !item.url) throw new Error('AGOL item has no service URL');
+    let layerUrl = item.url;
+    if (/FeatureServer$/i.test(layerUrl) || /MapServer$/i.test(layerUrl)) {
+      try {
+        const layersInfo = await fetch(`${layerUrl}/layers?f=json`).then(r => r.json());
+        const lyr0 = layersInfo?.layers?.[0]?.id ?? 0;
+        layerUrl = `${layerUrl}/${lyr0}`;
+      } catch { layerUrl = `${layerUrl}/0`; }
+    }
+    const params = new URLSearchParams({ where: '1=1', outFields: '*', outSR: '4326', f: 'geojson' });
+    return `${layerUrl}/query?${params.toString()}`;
+  }
+
+  // Create map with graceful fallback if the primary style 403s
+  async function createMap(styleUrl) {
+    return new Promise((resolve) => {
+      const m = new mapboxgl.Map({
+        container: 'map',
+        style: styleUrl,
+        center: [-120.5, 43.9],
+        zoom: 5.4,
+        pitch: 45,
+        bearing: 0,
+        interactive: true
+      });
+      m.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), 'top-left');
+      m.addControl(new mapboxgl.FullscreenControl(), 'top-left');
+      m.addControl(new mapboxgl.ScaleControl({ unit: 'imperial' }));
+
+      let triedFallback = false;
+      m.on('error', (e) => {
+        const msg = String(e?.error?.message || e?.error || '');
+        if (!triedFallback && /403|Forbidden|blocked by user/i.test(msg)) {
+          triedFallback = true;
+          m.remove();
+          createMap(STYLE_FALLBACK).then(resolve);
+        }
+      });
+
+      m.on('style.load', () => resolve(m));
+    });
+  }
+
+  let map;
+  (async () => {
+    map = await createMap(STYLE_PRIMARY);
+
+    // Roadless layer from AGOL (bright red)
+    const agolUrl = await buildAgolGeoJsonQueryUrl(AGOL_ITEM_ID);
+    map.addSource('roadless', { type: 'geojson', data: agolUrl, promoteId: ROADLESS_ID_FIELD });
+    map.addLayer({ id: 'roadless-fill', type: 'fill', source: 'roadless', paint: { 'fill-color': '#ff2d2d', 'fill-opacity': 0.45 } });
+    map.addLayer({ id: 'roadless-outline', type: 'line', source: 'roadless', paint: { 'line-color': '#b30000', 'line-width': 1.2 } });
+
+    // Fit to data once source is loaded
+    map.once('sourcedata', (e) => {
+      if (e.sourceId === 'roadless' && e.isSourceLoaded) {
+        const b = new mapboxgl.LngLatBounds();
+        const feats = map.querySourceFeatures('roadless');
+        for (const f of feats) {
+          const g = f.geometry; if (!g) continue;
+          if (g.type === 'Polygon') g.coordinates.flat(1).forEach(([x,y]) => b.extend([x,y]));
+          if (g.type === 'MultiPolygon') g.coordinates.flat(2).forEach(([x,y]) => b.extend([x,y]));
+        }
+        if (!b.isEmpty()) map.fitBounds(b, { padding: 48, duration: 700 });
+      }
+    });
+
+    // Smooth orbit animation (no terrain)
+    const southStart = [-123.0, 42.1];
+    const ring = [
+      [-124.2, 42.2], [-124.3, 43.7], [-124.1, 45.7],
+      [-122.9, 46.1], [-118.9, 45.9], [-117.1, 44.3],
+      [-118.0, 42.3], [-120.5, 42.1], [-123.0, 42.1]
+    ];
+    const path = [southStart, ...ring];
+    const LOOP_MS = 80000;
+    let idx = 0, playing = false, timer = null;
+
+    function step() {
+      const next = path[(idx + 1) % path.length];
+      const curr = path[idx];
+      const bearing = turf.bearing(turf.point(curr), turf.point(next));
+      const segDur = LOOP_MS / path.length;
+      map.easeTo({ center: next, bearing, pitch: 45, zoom: 5.8, duration: segDur, easing: t => t });
+      idx = (idx + 1) % path.length;
+      timer = setTimeout(() => { if (playing) step(); }, segDur);
+    }
+    function startOrbit() { if (!playing) { playing = true; step(); } }
+    function pauseOrbit() { playing = false; if (timer) clearTimeout(timer); }
+    function restartOrbit() { pauseOrbit(); idx = 0; startOrbit(); }
+
+    document.getElementById('play').onclick = startOrbit;
+    document.getElementById('pause').onclick = pauseOrbit;
+    document.getElementById('restart').onclick = restartOrbit;
+
+    // Auto-start
+    startOrbit();
+  })();
+</script>
+</body>
+</html>
