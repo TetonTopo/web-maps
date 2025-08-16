@@ -1,0 +1,224 @@
+import React, { useEffect, useRef } from 'react';
+import mapboxgl from 'mapbox-gl';
+import * as turf from '@turf/turf';
+import 'mapbox-gl/dist/mapbox-gl.css';
+
+mapboxgl.accessToken = 'pk.eyJ1IjoidGV0b250b3BvIiwiYSI6ImNtNm1jYzR1NzA1a2IybW83eGlkbnh5cjgifQ.i6aEqbk61S5evIU0zNFGpg';
+
+const STYLE_URL = 'mapbox://styles/mapbox/outdoors-v12';
+const ROADLESS_TILESET_ID = 'tetontopo.34pdvs6z';
+const ROADLESS_SOURCE_LAYER = 'Roadless_areas-23lokp';
+const PCT_TILESET_ID = 'tetontopo.993iycea';
+const PCT_SOURCE_LAYER = 'PacificCrestTrail-b76ecu';
+
+const OVERLAY_COLOR = '#b91c1c';
+const FILL_OPACITY = 0.55;
+const PCT_COLOR = '#0b5d1e';
+const ID_KEYS = ['roadless_id', 'UID', 'ID', 'OBJECTID', 'FID', 'unique_id', 'id'];
+const NAME_KEYS = ['Roadless_Name', 'Name', 'NAME', 'name', 'UnitName', 'unit_name', 'RoadlessName'];
+
+const MapComponent = () => {
+  const mapContainer = useRef(null);
+  const noteRef = useRef(null);
+
+  const log = (m) => {
+    if (noteRef.current) noteRef.current.innerHTML += `\n${m}`;
+  };
+
+  const getTileJSONBounds = async (tileset) => {
+    try {
+      const url = `https://api.mapbox.com/v4/${tileset}.json?secure&access_token=${mapboxgl.accessToken}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`TileJSON HTTP ${r.status}`);
+      const tj = await r.json();
+      return { bounds: tj.bounds || null, center: tj.center || null };
+    } catch (err) {
+      log(`Bounds lookup failed for ${tileset}: ${err}`);
+      return { bounds: null, center: null };
+    }
+  };
+
+  const unionBounds = (a, b) => {
+    if (!a) return b;
+    if (!b) return a;
+    const [aw, as, ae, an] = a;
+    const [bw, bs, be, bn] = b;
+    return [Math.min(aw, bw), Math.min(as, bs), Math.max(ae, be), Math.max(an, bn)];
+  };
+
+  useEffect(() => {
+    const map = new mapboxgl.Map({
+      container: mapContainer.current,
+      style: STYLE_URL,
+      center: [-120.5, 44.0],
+      zoom: 5
+    });
+
+    map.addControl(new mapboxgl.NavigationControl(), 'top-right');
+
+    class SurveyControl {
+      onAdd() {
+        const container = document.createElement('div');
+        container.className = 'mapboxgl-ctrl';
+        const a = document.createElement('a');
+        a.className = 'survey-btn';
+        a.href = 'https://www.outdooralliance.org/roadless#:~:text=The%20Roadless%20Rule%20protects%2058,%2C%20paddling,%20and%20backcountry%20skiing';
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = 'Take the Survey';
+        container.appendChild(a);
+        this._container = container;
+        return container;
+      }
+      onRemove() { this._container.remove(); }
+    }
+    map.addControl(new SurveyControl(), 'top-right');
+
+    class LegendControl {
+      onAdd() {
+        const wrap = document.createElement('div');
+        wrap.className = 'mapboxgl-ctrl';
+        const card = document.createElement('div');
+        card.className = 'legend-card';
+        card.innerHTML = `
+          <div class="legend-title">Legend</div>
+          <div class="legend-item">
+            <span class="legend-swatch">
+              <svg width="32" height="16" viewBox="0 0 32 16" xmlns="http://www.w3.org/2000/svg">
+                <line x1="2" y1="8" x2="30" y2="8" stroke="${PCT_COLOR}" stroke-width="3" stroke-linecap="round" stroke-dasharray="6 3" />
+              </svg>
+            </span>
+            <span>PCT (Pacific Crest Trail)</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-swatch">
+              <svg width="32" height="16" viewBox="0 0 32 16" xmlns="http://www.w3.org/2000/svg">
+                <rect x="2" y="2" width="28" height="12" fill="${OVERLAY_COLOR}" fill-opacity="${FILL_OPACITY}" stroke="${OVERLAY_COLOR}" stroke-width="1.5" />
+              </svg>
+            </span>
+            <span>Roadless Area</span>
+          </div>
+        `;
+        wrap.appendChild(card);
+        this._container = wrap;
+        return wrap;
+      }
+      onRemove() { this._container.remove(); }
+    }
+    map.addControl(new LegendControl(), 'bottom-right');
+
+    map.addControl(new mapboxgl.ScaleControl({ maxWidth: 150, unit: 'imperial' }));
+
+    map.on('error', (e) => {
+      if (e?.error?.status || e?.error?.message) {
+        log(`Map error: ${e.error.status || ''} ${e.error.message || ''}`);
+      }
+    });
+
+    map.once('load', async () => {
+      if (noteRef.current) noteRef.current.textContent = 'Basemap loaded. Adding sources + layers…';
+
+      map.addSource('roadless-src', { type: 'vector', url: `mapbox://${ROADLESS_TILESET_ID}` });
+      map.addSource('pct-src', { type: 'vector', url: `mapbox://${PCT_TILESET_ID}` });
+
+      const firstSymbol = map.getStyle().layers.find(l => l.type === 'symbol')?.id;
+
+      map.addLayer({
+        id: 'roadless-fill',
+        type: 'fill',
+        source: 'roadless-src',
+        'source-layer': ROADLESS_SOURCE_LAYER,
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: { 'fill-color': OVERLAY_COLOR, 'fill-opacity': FILL_OPACITY }
+      }, firstSymbol);
+
+      map.addLayer({
+        id: 'roadless-line',
+        type: 'line',
+        source: 'roadless-src',
+        'source-layer': ROADLESS_SOURCE_LAYER,
+        filter: ['any', ['==', ['geometry-type'], 'LineString'], ['==', ['geometry-type'], 'Polygon']],
+        paint: { 'line-color': OVERLAY_COLOR, 'line-width': 1.5 }
+      }, firstSymbol);
+
+      map.addLayer({
+        id: 'pct-line',
+        type: 'line',
+        source: 'pct-src',
+        'source-layer': PCT_SOURCE_LAYER,
+        filter: ['any', ['==', ['geometry-type'], 'LineString'], ['==', ['geometry-type'], 'MultiLineString']],
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+          'line-color': PCT_COLOR,
+          'line-opacity': 0.98,
+          'line-width': ['interpolate', ['linear'], ['zoom'], 3, 1.4, 8, 2.8, 12, 4.2, 16, 6.5, 20, 10],
+          'line-dasharray': ['step', ['zoom'], ['literal', [2, 2]], 10, ['literal', [3, 2]], 16, ['literal', [4, 2]]]
+        }
+      }, firstSymbol);
+
+      map.on('mouseenter', 'roadless-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
+      map.on('mouseleave', 'roadless-fill', () => { map.getCanvas().style.cursor = ''; });
+
+      const popup = new mapboxgl.Popup({ closeButton: true, closeOnClick: true });
+      map.on('click', 'roadless-fill', (e) => {
+        const f = e.features && e.features[0];
+        if (!f) return;
+        const props = f.properties || {};
+        const nameKey = NAME_KEYS.find(k => props[k] !== undefined);
+        const idKey = ID_KEYS.find(k => props[k] !== undefined);
+        const name = nameKey ? String(props[nameKey]) : 'Unnamed area';
+        const uid = idKey ? String(props[idKey]) : null;
+
+        const gj = { type: 'Feature', properties: {}, geometry: f.geometry };
+
+        let acresTxt = '—';
+        try {
+          const m2 = turf.area(gj);
+          const acres = m2 / 4046.8564224;
+          if (Number.isFinite(acres)) acresTxt = acres.toLocaleString('en-US', { maximumFractionDigits: 0 });
+        } catch {}
+
+        popup
+          .setLngLat(e.lngLat)
+          .setHTML(`
+            <div style="font:600 14px system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">${name}</div>
+            ${uid ? `<div style="font:12px/1.4 system-ui;color:#555">ID: ${uid}</div>` : ''}
+            <div style="margin-top:6px;font:12px/1.4 system-ui;color:#333"><b>Acres:</b> ${acresTxt}</div>
+          `)
+          .addTo(map);
+      });
+
+      log('Layers added. Popups enabled with live Acres.');
+
+      const [rMeta, pMeta] = await Promise.all([
+        getTileJSONBounds(ROADLESS_TILESET_ID),
+        getTileJSONBounds(PCT_TILESET_ID)
+      ]);
+      const ub = unionBounds(rMeta.bounds, pMeta.bounds);
+      if (ub) {
+        const [w, s, e, n] = ub;
+        map.fitBounds([[w, s], [e, n]], { padding: 40, duration: 0 });
+        log('View fit to union of Roadless + PCT bounds.');
+      } else if (rMeta.center?.length >= 2) {
+        map.setCenter([rMeta.center[0], rMeta.center[1]]);
+        if (rMeta.center.length >= 3) map.setZoom(rMeta.center[2]);
+        log('Centered using Roadless center metadata.');
+      }
+    });
+  }, []);
+
+  return (
+    <div style={{ position: 'relative', height: '100vh' }}>
+      <div ref={mapContainer} id="map" style={{ position: 'absolute', top: 0, bottom: 0, width: '100%' }} />
+      <div ref={noteRef} className="note" style={{
+        position: 'absolute', zIndex: 2, top: '12px', left: '12px',
+        background: 'rgba(255,255,255,.95)', borderRadius: '8px', padding: '10px 12px',
+        fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif',
+        fontSize: '13px', boxShadow: '0 2px 10px rgba(0,0,0,.12)', maxWidth: '520px',
+        maxHeight: '60%', overflow: 'auto', whiteSpace: 'pre-wrap'
+      }}>Loading…</div>
+    </div>
+  );
+};
+
+export default MapComponent;
